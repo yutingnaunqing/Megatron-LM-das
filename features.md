@@ -117,3 +117,13 @@ def unpermute(
 
 
 
+
+### HCU Linear Cross Entropy
+
+当前版本使用 `hcu_megatron/megatron_adaptor.py`、`ADAPTOR_FEATURES` 和
+`MegatronPatchesManager.register_patch` 注册适配（本文开头的 adaptor 路径和
+`MegatronAdaptation.register` 为旧接口示例）。
+
+通过 `--use-hcu-linear-cross-entropy` 启用独立 Linear CE Feature，使用 wrapper
+在 GPT 的 `output_processor` 扩展点接入融合输出投影与交叉熵。具体限制、
+调用链和验证方法见 [Linear CE 适配说明](docs/linear_ce_adaptor.md)。
