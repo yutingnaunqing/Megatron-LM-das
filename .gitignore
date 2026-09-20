@@ -4,6 +4,6 @@ __pycache__
 .vscode
 .idea
 .coverage.*
-.examples.*
-.requirements.*
-.3rdpart.*
+examples/
+requirements/
+3rdpart/
