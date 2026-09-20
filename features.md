@@ -115,15 +115,6 @@ def unpermute(
 3. recompute-layer-ids/recompute-mtp-layer-ids允许同时设置，或只设置一个。如不设置，相应网络层不进行重计算；
 4. 不允许设置recompute-method参数。
 
+### 融合线性交叉熵 HCU Linear Cross Entropy
 
-
-
-### HCU Linear Cross Entropy
-
-当前版本使用 `hcu_megatron/megatron_adaptor.py`、`ADAPTOR_FEATURES` 和
-`MegatronPatchesManager.register_patch` 注册适配（本文开头的 adaptor 路径和
-`MegatronAdaptation.register` 为旧接口示例）。
-
-通过 `--use-hcu-linear-cross-entropy` 启用独立 Linear CE Feature，使用 wrapper
-在 GPT 的 `output_processor` 扩展点接入融合输出投影与交叉熵。具体限制、
-调用链和验证方法见 [Linear CE 适配说明](docs/linear_ce_adaptor.md)。
++ 通过`--use-hcu-linear-cross-entropy`启用独立 Linear CE Feature，分块计算logits减少显存压力，使用wrapper在GPT的 `output_processor` 扩展点接入融合输出投影与交叉熵。具体限制、调用链和验证方法见 [Linear CE 使用说明](docs/features/fusion_linear_ce.md)。
