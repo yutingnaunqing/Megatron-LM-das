@@ -115,17 +115,18 @@ native 构建与 HCU 正确性验证在 flash-train 的 `linear_cross_entropy/` 
 
 ## 训练接入测试
 
-以下测试用于验证 `--use-hcu-linear-cross-entropy` 的 GPT 接入逻辑和训练 loss 适配，不需要 HCU 设备或 native `.so`。请在仓库根目录执行命令。
+以下测试用于验证 `--cross-entropy-loss-fusion --cross-entropy-fusion-impl linear` 的 GPT 接入逻辑和训练 loss 适配，不需要 HCU 设备或 native `.so`。两个参数同时生效时，`gpt_model_postprocess` 直接调用融合训练损失接口。请在仓库根目录执行命令。
 
 ### GPT 适配契约测试
 
-[test_hcu_linear_cross_entropy_adaptor.py](../../../../tests/unit_tests/fusions/test_hcu_linear_cross_entropy_adaptor.py) 使用真实补丁管理器和原 HCU GPT `_postprocess` 函数体，并替换其外部依赖，检查：
+[test_hcu_linear_cross_entropy_adaptor.py](../../../../tests/unit_tests/fusions/test_hcu_linear_cross_entropy_adaptor.py) 执行生产代码中的参数处理函数和 HCU GPT `_postprocess` 函数体，并替换其外部依赖，检查：
 
-- 开关默认关闭，以及 BF16、TP/CP、SP、MTP 等配置校验。
-- wrapper 对位置参数、关键字参数和带 labels 验证调用的处理。
+- 官方参数的默认值、`linear` 选项扩展，以及 BF16、TP/CP、SP、MTP 等配置校验。
+- 两个参数共同控制融合路径，`native/te` 保留原路径；训练和带 labels 验证调用均使用融合路径。
 - 非输出阶段、无 labels 和活动推理模式下的原路径回退。
-- 不支持的配置、缺失的 `loss_mask`、packed sequence 和已有 `output_processor` 冲突在进入原函数前被拒绝。
-- Feature 注册、基础补丁与 wrapper 的组合、补丁移除，以及共享权重和输出层权重的选择。
+- 不支持的静态配置在 Feature 参数校验阶段被拒绝；缺失的 `loss_mask`、packed sequence、`mtp_in_postprocess` 和已有 `output_processor` 冲突在 GPT 输出计算前被拒绝。
+- Feature 仅扩展已有参数选项（兼容 list/tuple、重复调用和早期解析器缺少该参数的情况），不再注册额外补丁，以及共享权重和输出层权重的选择。
+- 早期适配参数不含官方开关时，完整参数校验仍生效，并在上游校验后恢复 `linear` 配置。
 
 ```bash
 python -m unittest discover -s tests/unit_tests/fusions \

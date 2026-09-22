@@ -4,7 +4,7 @@
 
 HCU Linear CE 将输出层的线性投影与交叉熵计算融合，沿词表维度分块计算 logits，并通过在线 Softmax 累积损失计算所需的统计量。反向传播时，分块重算局部 logits 及其梯度，并计算隐藏状态梯度 `dHidden` 和输出权重梯度 `dWeight`，避免在全局显存中保存完整的 logits 和 dLogits 张量，从而降低输出层与损失计算的中间显存开销。
 
-该特性通过 GPT 的 `output_processor` 扩展接口接入，无需修改训练循环。具体显存收益和训练性能取决于模型规模、序列长度、词表大小及设备配置。
+该特性在 HCU GPT 的 `gpt_model_postprocess` 中直接接入，复用官方交叉熵融合参数，无需修改训练循环。开启后，输出阶段直接将隐藏状态、输出权重、labels 和 loss_mask 传给融合算子，跳过单独的输出投影与交叉熵计算。具体显存收益和训练性能取决于模型规模、序列长度、词表大小及设备配置。
 
 ### 使用方法
 
@@ -18,13 +18,15 @@ export HCU_LINEAR_CE_EXTENSION_PATH=/path/to/libhcu_linear_ce_gfx936.so
 在传给 `pretrain_gpt.py` 的训练参数中加入：
 
 ```bash
---use-hcu-linear-cross-entropy
+--cross-entropy-loss-fusion \
+--cross-entropy-fusion-impl linear
 ```
 
 当前实现要求使用 BF16，且张量并行度（TP）和上下文并行度（CP）均为 1。首次验证建议使用流水线并行度（PP）为 1 的配置：
 
 ```bash
---use-hcu-linear-cross-entropy \
+--cross-entropy-loss-fusion \
+--cross-entropy-fusion-impl linear \
 --bf16 \
 --tensor-model-parallel-size 1 \
 --context-parallel-size 1 \
@@ -45,5 +47,6 @@ export HCU_LINEAR_CE_LOG_LEVEL=1
 2. **不兼容特性**：不支持 MTP、MuP、`--enable-vocab-parallel`、延迟 embedding 权重梯度计算及 packed sequence；不能与其他自定义 `output_processor` 同时使用。
 3. **损失掩码**：训练时必须提供与 labels 形状一致的二值 `loss_mask`，其中 1 表示参与损失计算，0 表示忽略；不支持任意加权掩码。
 4. **损失语义**：native 算子返回有效 token 的平均交叉熵。训练适配器将其缩放并展开为 `[batch, sequence]` 张量，以保持当前 `sum(loss * loss_mask)` 聚合下的总损失和梯度语义。展开后的值不是真实的逐 token 损失，不能直接用于逐 token 指标或其他损失聚合方式。
-5. **生效范围**：带 labels 的训练和常规验证使用融合路径；无 labels 的调用、活动推理模式及非输出流水线阶段继续使用原路径。不添加开关时，不安装该特性的补丁。
-
+5. **生效范围**：仅在 `cross_entropy_loss_fusion=True` 且 `cross_entropy_fusion_impl='linear'` 时启用。带 labels 的训练和常规验证使用融合路径；无 labels 的调用、活动推理模式及非输出流水线阶段继续使用原路径。未开启融合或选择 `native/te` 时，保留原有处理流程。
+6. **参数迁移**：旧的 `--use-hcu-linear-cross-entropy` 已移除，请替换为上述两个官方参数。Feature 的 `register_args()` 仅为已有的 `--cross-entropy-fusion-impl` 参数补充 `linear` 选项，不新增参数；`validate_args()` 负责配置校验，不再为 GPT 叠加 wrapper。
+7. **校验职责**：BF16、TP/CP、SP、MTP 等静态配置由 `LinearCrossEntropyFeature.validate_args()` 在启动时统一校验；GPT 后处理仅检查本次调用的 mask、packed sequence、MTP 执行标志和自定义输出处理器。直接构造模型、绕过标准训练入口时，调用方需先完成同等配置校验。

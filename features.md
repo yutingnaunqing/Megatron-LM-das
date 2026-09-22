@@ -117,4 +117,4 @@ def unpermute(
 
 ### 融合线性交叉熵 HCU Linear Cross Entropy
 
-+ 通过`--use-hcu-linear-cross-entropy`启用独立 Linear CE Feature，分块计算logits减少显存压力，使用wrapper在GPT的 `output_processor` 扩展点接入融合输出投影与交叉熵。具体限制、调用链和验证方法见 [Linear CE 使用说明](docs/features/fusion_linear_ce.md)。
++ 通过 `--cross-entropy-loss-fusion --cross-entropy-fusion-impl linear` 启用 HCU Linear CE，分块计算 logits 减少显存压力，在 GPT 的 `gpt_model_postprocess` 中直接融合输出投影与交叉熵。具体限制、调用链和验证方法见 [Linear CE 使用说明](docs/features/fusion_linear_ce.md)。

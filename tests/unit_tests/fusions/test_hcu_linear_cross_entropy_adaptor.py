@@ -1,13 +1,13 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contract tests using the real patch manager and HCU postprocess body."""
+"""CPU contract tests executing production functions with mocked dependencies."""
 
 import argparse
 import ast
 import importlib.util
 import sys
-import types
 import unittest
+from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -22,8 +22,14 @@ def load(name, path):
     return module
 
 
-adapter = load("linear_ce_adapter", "hcu_megatron/core/models/gpt/linear_cross_entropy.py")
-patches = load("linear_ce_patches", "hcu_megatron/patch_utils.py")
+def load_functions(path, names, namespace):
+    tree = ast.parse((ROOT / path).read_text())
+    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    assert len(nodes) == len(names)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), path, "exec"), namespace)
+    return namespace
+
+
 base = load("linear_ce_features.feature", "hcu_megatron/features_manager/feature.py")
 with mock.patch.dict(sys.modules, {"linear_ce_features.feature": base}):
     feature_module = load(
@@ -35,50 +41,80 @@ with mock.patch.dict(sys.modules, {"linear_ce_features.feature": base}):
 class TestLinearCEAdaptor(unittest.TestCase):
     def setUp(self):
         self.inference = SimpleNamespace(is_active=lambda: False)
-        self.module_context = mock.patch.dict(
-            sys.modules,
+        self.args = SimpleNamespace(enable_vocab_parallel=False)
+        self.ordinary_ce = mock.Mock()
+        self.ordinary_ce.return_value.transpose.return_value.contiguous.return_value = "ordinary-loss"
+        self.namespace = load_functions(
+            "hcu_megatron/core/models/gpt/gpt_model.py",
+            {"gpt_model_postprocess"},
             {
-                "megatron.core.inference.utils": SimpleNamespace(InferenceMode=self.inference),
-                "hcu_megatron.core.models.gpt.linear_cross_entropy": adapter,
+                "InferenceMode": self.inference,
+                "get_args": lambda: self.args,
+                "tensor_parallel": SimpleNamespace(vocab_parallel_cross_entropy=self.ordinary_ce),
+                "has_config_logger_enabled": lambda config: False,
             },
         )
-        self.module_context.start()
-        self.addCleanup(self.module_context.stop)
-        self.feature = feature_module.LinearCrossEntropyFeature()
-        self.model = SimpleNamespace(
-            compute_language_model_loss=object(),
-            _scale_logits=object(),
-            post_process=True,
-            config=SimpleNamespace(mtp_num_layers=None),
-            share_embeddings_and_output_weights=False,
-            output_layer=SimpleNamespace(weight=object()),
+        self.native = mock.Mock(return_value="fused-loss")
+        context = mock.patch.dict(
+            sys.modules,
+            {
+                "hcu_megatron.core.fusions.fused_linear_cross_entropy": SimpleNamespace(
+                    linear_cross_entropy_for_training=self.native
+                ),
+            },
         )
-        self.calls = []
+        context.start()
+        self.addCleanup(context.stop)
+        self.feature = feature_module.LinearCrossEntropyFeature()
+        self.logits = mock.Mock()
+        self.logits.transpose.return_value.contiguous.return_value = "inference-logits"
+        self.model = SimpleNamespace(
+            post_process=True,
+            training=True,
+            config=SimpleNamespace(
+                cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="linear", mtp_num_layers=None, use_mup=False
+            ),
+            share_embeddings_and_output_weights=False,
+            output_layer=mock.Mock(return_value=(self.logits, None)),
+            shared_embedding_or_output_weight=mock.Mock(return_value=object()),
+            _scale_logits=lambda logits: logits,
+            compute_language_model_loss=mock.Mock(return_value="ordinary-loss"),
+        )
 
-    def make_wrapper(self):
-        # Use the production parameter name for the model.
-        calls = self.calls
+    def call(self, labels="labels", **kwargs):
+        return self.namespace["gpt_model_postprocess"](
+            self.model, "hidden", "ids", "positions", labels, None, None, None, **({"loss_mask": "mask"} | kwargs)
+        )
 
-        def original(
-            self,
-            hidden_states,
-            labels,
-            loss_mask=None,
-            *,
-            output_processor=None,
-            packed_seq_params=None,
-            mtp_in_postprocess=None
-        ):
-            calls.append(output_processor)
-            return output_processor
+    def test_official_parser_choices_and_feature_registration(self):
+        for choices in (["native", "te"], ("native", "te"), ["native", "te", "linear"]):
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--cross-entropy-loss-fusion", action="store_true")
+            action = parser.add_argument("--cross-entropy-fusion-impl", choices=choices, default="native")
+            original_actions = list(parser._actions)
+            self.feature.register_args(parser)
+            self.feature.register_args(parser)
+            self.assertEqual(parser._actions, original_actions)
+            self.assertFalse(parser.parse_args([]).cross_entropy_loss_fusion)
+            self.assertEqual(parser.parse_args([]).cross_entropy_fusion_impl, "native")
+            args = parser.parse_args(["--cross-entropy-loss-fusion", "--cross-entropy-fusion-impl", "linear"])
+            self.assertTrue(args.cross_entropy_loss_fusion)
+            self.assertEqual(args.cross_entropy_fusion_impl, "linear")
+            self.assertEqual(action.choices.count("linear"), 1)
+            self.assertNotIn("--use-hcu-linear-cross-entropy", parser._option_string_actions)
+        early_parser = argparse.ArgumentParser()
+        original_actions = list(early_parser._actions)
+        self.feature.register_args(early_parser)
+        self.assertEqual(early_parser._actions, original_actions)
+        recorder = mock.Mock()
+        self.feature.register_patches(recorder, argparse.Namespace())
+        recorder.register_patch.assert_not_called()
 
-        return adapter.linear_ce_postprocess_wrapper(original)
-
-    def test_args_are_opt_in_and_validate(self):
-        parser = argparse.ArgumentParser()
-        self.feature.register_args(parser)
-        self.assertFalse(parser.parse_args([]).use_hcu_linear_cross_entropy)
-        args = parser.parse_args(["--use-hcu-linear-cross-entropy"])
+    def test_validation_requires_both_flags(self):
+        for enabled, impl in [(False, "linear"), (True, "native"), (True, "te")]:
+            args = argparse.Namespace(cross_entropy_loss_fusion=enabled, cross_entropy_fusion_impl=impl)
+            self.assertIs(self.feature.validate_args(args), args)
+        args = argparse.Namespace(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="linear")
         with self.assertRaisesRegex(ValueError, "bf16"):
             self.feature.validate_args(args)
         args.bf16 = True
@@ -98,25 +134,75 @@ class TestLinearCEAdaptor(unittest.TestCase):
                     self.feature.validate_args(args)
                 delattr(args, name)
 
-    def test_positional_keyword_and_eval_calls(self):
-        wrapped = self.make_wrapper()
-        self.model.training = False
-        self.assertIs(wrapped(self.model, "hidden", "labels", "mask"), adapter.linear_ce_output_processor)
-        self.assertIs(
-            wrapped(self.model, hidden_states="hidden", labels="labels", loss_mask="mask"),
-            adapter.linear_ce_output_processor,
+    def test_validation_runs_with_empty_early_adaptor_args(self):
+        namespace = load_functions(
+            "hcu_megatron/training/arguments.py",
+            {"validate_args_func_decorator"},
+            {
+                "wraps": wraps,
+                "ADAPTOR_FEATURES": [self.feature],
+                "ORIGIN_ARG_VALUES": {},
+                "get_adaptor_args": lambda: argparse.Namespace(),
+                "_print_env_vars": lambda *a, **kw: None,
+            },
+        )
+        args = argparse.Namespace(
+            cross_entropy_loss_fusion=True,
+            cross_entropy_fusion_impl="linear",
+            schedule_method=None,
+            delay_wgrad_compute=False,
+            cuda_graph_impl="none",
+            sync_free_moe_backend=None,
+            use_primus_deepep=False,
+            bf16=True,
         )
 
-    def test_fallback_preserves_processor(self):
-        wrapped = self.make_wrapper()
-        sentinel = object()
-        for stage, labels, inference in [(False, "labels", False), (True, None, False), (True, "labels", True)]:
-            self.model.post_process = stage
-            self.inference.is_active = lambda: inference
-            self.assertIs(wrapped(self.model, "hidden", labels, output_processor=sentinel), sentinel)
+        def upstream(args, defaults):
+            self.assertEqual(args.cross_entropy_fusion_impl, "native")
+            return args
 
-    def test_rejections_happen_before_original(self):
-        wrapped = self.make_wrapper()
+        validate = namespace["validate_args_func_decorator"](upstream)
+        self.assertIs(validate(args), args)
+        self.assertEqual(args.cross_entropy_fusion_impl, "linear")
+        args.bf16 = False
+        with self.assertRaisesRegex(ValueError, "bf16"):
+            validate(args)
+
+    def test_fused_training_eval_and_weight_selection(self):
+        for shared in (False, True):
+            for training in (False, True):
+                self.model.training = training
+                self.model.share_embeddings_and_output_weights = shared
+                self.assertEqual(self.call(), "fused-loss")
+                weight = (
+                    self.model.shared_embedding_or_output_weight.return_value
+                    if shared
+                    else self.model.output_layer.weight
+                )
+                self.native.assert_called_with("hidden", weight, "labels", "mask")
+        self.model.output_layer.assert_not_called()
+        self.model.compute_language_model_loss.assert_not_called()
+
+    def test_other_backends_keep_original_path(self):
+        for enabled, impl in [(False, "linear"), (False, "native"), (True, "native"), (True, "te")]:
+            self.model.config.cross_entropy_loss_fusion = enabled
+            self.model.config.cross_entropy_fusion_impl = impl
+            self.assertEqual(self.call(), "ordinary-loss")
+        self.native.assert_not_called()
+        self.assertEqual(self.model.output_layer.call_count, 4)
+
+    def test_non_output_and_inference_keep_original_path(self):
+        self.model.post_process = False
+        self.assertEqual(self.call(), "hidden")
+        self.model.post_process = True
+        self.assertEqual(self.call(labels=None), "inference-logits")
+        self.inference.is_active = lambda: True
+        labels = mock.Mock()
+        self.assertEqual(self.call(labels=labels, runtime_gather_output=True), "ordinary-loss")
+        self.ordinary_ce.assert_called_once_with(self.logits, labels.transpose.return_value.contiguous.return_value)
+        self.native.assert_not_called()
+
+    def test_rejections_happen_before_output_or_native(self):
         for extra, message in [
             ({"loss_mask": None}, "loss_mask"),
             ({"packed_seq_params": object()}, "packed_seq_params"),
@@ -124,73 +210,9 @@ class TestLinearCEAdaptor(unittest.TestCase):
             ({"mtp_in_postprocess": True}, "mtp_in_postprocess"),
         ]:
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
-                wrapped(self.model, "hidden", "labels", **({"loss_mask": "mask"} | extra))
-        self.model.config.mtp_num_layers = 1
-        with self.assertRaisesRegex(ValueError, "mtp_num_layers"):
-            wrapped(self.model, "hidden", "labels", "mask")
-        self.assertEqual(self.calls, [])
-
-    def test_patch_manager_composes_with_real_hcu_body(self):
-        # Execute the unchanged production body with only its external dependencies
-        # substituted. This verifies the real output_processor location and signature.
-        tree = ast.parse((ROOT / "hcu_megatron/core/models/gpt/gpt_model.py").read_text())
-        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "gpt_model_postprocess")
-        namespace = {"InferenceMode": self.inference}
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "<hcu-postprocess>", "exec"), namespace)
-        hcu_original = namespace["gpt_model_postprocess"]
-        target = types.ModuleType("linear_ce_patch_target")
-        target.GPTModel = type("GPTModel", (), {"_postprocess": lambda *a, **kw: "upstream"})
-        manager = patches.MegatronPatchesManager
-        old_registry = manager.patches_info
-        manager.patches_info = {}
-        self.addCleanup(setattr, manager, "patches_info", old_registry)
-        with mock.patch.dict(sys.modules, {"linear_ce_patch_target": target}):
-            path = "linear_ce_patch_target.GPTModel._postprocess"
-            manager.register_patch(path, hcu_original)
-            # Verify Feature registers the expected public target and wrapper.
-            recorder = mock.Mock()
-            self.feature.register_patches(recorder, argparse.Namespace())
-            args, kwargs = recorder.register_patch.call_args
-            self.assertEqual(args[0], "megatron.core.models.gpt.gpt_model.GPTModel._postprocess")
-            manager.register_patch(path, args[1], **kwargs)
-            manager.apply_patches()
-            processor = mock.Mock(return_value="fused-loss")
-            with mock.patch.object(adapter, "linear_ce_output_processor", processor):
-                result = target.GPTModel._postprocess(
-                    self.model,
-                    "hidden",
-                    "ids",
-                    "positions",
-                    "labels",
-                    None,
-                    None,
-                    None,
-                    loss_mask="mask",
-                )
-            self.assertEqual(result, "fused-loss")
-            self.assertIs(processor.call_args.kwargs["output_layer"], self.model.output_layer)
-            self.assertEqual(processor.call_args.kwargs["loss_mask"], "mask")
-            manager.remove_patches()
-            self.assertEqual(target.GPTModel._postprocess(), "upstream")
-
-    def test_processor_selects_shared_or_output_weight(self):
-        native = mock.Mock(return_value="loss")
-        fake = SimpleNamespace(linear_cross_entropy_for_training=native)
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "hcu_megatron.core.fusions.fused_linear_cross_entropy": fake,
-            },
-        ):
-            for shared in (None, object()):
-                adapter.linear_ce_output_processor(
-                    hidden_states="hidden",
-                    output_layer=self.model.output_layer,
-                    output_weight=shared,
-                    labels="labels",
-                    loss_mask="mask",
-                )
-                self.assertIs(native.call_args.args[1], self.model.output_layer.weight if shared is None else shared)
+                self.call(**extra)
+        self.model.output_layer.assert_not_called()
+        self.native.assert_not_called()
 
 
 if __name__ == "__main__":
