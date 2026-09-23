@@ -11,7 +11,7 @@ HCU Linear CE 将输出层的线性投影与交叉熵计算融合，沿词表维
 使用前，需要在训练环境中安装与 HCU 架构及 PyTorch 版本匹配的 Linear CE 算子包。安装和动态库加载方式见 [HCU Linear CE 算子说明](../../hcu_megatron/core/fusions/linear_cross_entropy/README.md#安装和加载)。若需要指定动态库，可设置：
 
 ```bash
-# 替换为实际的库文件路径；已安装匹配的算子包时通常无需设置。
+# 替换为实际的库文件路径；已安装匹配的算子包时无需设置。
 export HCU_LINEAR_CE_EXTENSION_PATH=/path/to/libhcu_linear_ce_gfx936.so
 ```
 
@@ -20,6 +20,10 @@ export HCU_LINEAR_CE_EXTENSION_PATH=/path/to/libhcu_linear_ce_gfx936.so
 ```bash
 --cross-entropy-loss-fusion \
 --cross-entropy-fusion-impl linear
+```
+注：若报错不支持kernel family，需要加上参数：
+```bash
+--make-vocab-size-divisible-by 256
 ```
 
 当前实现要求使用 BF16，且张量并行度（TP）和上下文并行度（CP）均为 1。首次验证建议使用流水线并行度（PP）为 1 的配置：
@@ -42,11 +46,7 @@ export HCU_LINEAR_CE_LOG_LEVEL=1
 ```
 
 ### 注意事项
-
 1. **数据类型与并行配置**：隐藏状态和输出权重必须使用 BF16；TP=1、CP=1，关闭序列并行（SP）。当前算子接口支持数据并行（DP）；流水线并行组合尚未完成验证，首次使用建议 PP=1，并根据显存容量调整模型、序列长度和 batch size。
 2. **不兼容特性**：不支持 MTP、MuP、`--enable-vocab-parallel`、延迟 embedding 权重梯度计算及 packed sequence；不能与其他自定义 `output_processor` 同时使用。
 3. **损失掩码**：训练时必须提供与 labels 形状一致的二值 `loss_mask`，其中 1 表示参与损失计算，0 表示忽略；不支持任意加权掩码。
-4. **损失语义**：native 算子返回有效 token 的平均交叉熵。训练适配器将其缩放并展开为 `[batch, sequence]` 张量，以保持当前 `sum(loss * loss_mask)` 聚合下的总损失和梯度语义。展开后的值不是真实的逐 token 损失，不能直接用于逐 token 指标或其他损失聚合方式。
-5. **生效范围**：仅在 `cross_entropy_loss_fusion=True` 且 `cross_entropy_fusion_impl='linear'` 时启用。带 labels 的训练和常规验证使用融合路径；无 labels 的调用、活动推理模式及非输出流水线阶段继续使用原路径。未开启融合或选择 `native/te` 时，保留原有处理流程。
-6. **参数迁移**：旧的 `--use-hcu-linear-cross-entropy` 已移除，请替换为上述两个官方参数。Feature 的 `register_args()` 仅为已有的 `--cross-entropy-fusion-impl` 参数补充 `linear` 选项，不新增参数；`validate_args()` 负责配置校验，不再为 GPT 叠加 wrapper。
-7. **校验职责**：BF16、TP/CP、SP、MTP 等静态配置由 `LinearCrossEntropyFeature.validate_args()` 在启动时统一校验；GPT 后处理仅检查本次调用的 mask、packed sequence、MTP 执行标志和自定义输出处理器。直接构造模型、绕过标准训练入口时，调用方需先完成同等配置校验。
+4. **损失语义**：native 算子返回有效 token 的平均交叉熵。训练适配器将其缩放并展开为 `[batch, sequence]` 张量，以保持当前 `sum(loss * loss_mask)` 聚合下的总损失和梯度语义。展开后的值不是真实的逐token损失，不能直接用于逐token指标或其他损失聚合方式。
